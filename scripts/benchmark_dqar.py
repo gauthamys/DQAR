@@ -22,7 +22,9 @@ from typing import Dict, List, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import torch
+import urllib.request
 from diffusers import DiTPipeline
+from urllib.parse import urlparse
 
 from dqar import DQARConfig, DQARController
 
@@ -35,6 +37,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="'cuda' or 'cpu'.")
     parser.add_argument("--conditioning", choices=("text", "class"), default="text")
     parser.add_argument("--prompts", type=Path, help="Optional text file (one prompt per line).")
+    parser.add_argument("--prompt-dataset-url", help="HTTP(S) URL pointing to a text/JSON/JSONL prompt dataset.")
+    parser.add_argument("--prompt-dataset-format", choices=("auto", "txt", "json", "jsonl"), default="auto")
+    parser.add_argument("--prompt-dataset-field", default="prompt", help="Key to pull from JSON/JSONL rows.")
+    parser.add_argument(
+        "--prompt-dataset-cache-dir", type=Path, default=Path("prompt_datasets"), help="Where downloaded prompts are cached."
+    )
+    parser.add_argument(
+        "--prompt-dataset-refresh", action="store_true", help="Force re-download of the prompt dataset even if cached."
+    )
     parser.add_argument("--class-ids", help="Comma-separated class ids or path to file (one id per line).")
     parser.add_argument("--num-prompts", type=int, default=4, help="Fallback prompt count / class count.")
     parser.add_argument("--steps", type=int, default=30, help="Number of inference steps.")
@@ -70,6 +81,89 @@ def load_prompts(path: Path | None, count: int) -> List[str]:
         return defaults[:count]
     extra = [f"Abstract geometry #{i}" for i in range(count - len(defaults))]
     return defaults + extra
+
+
+def download_prompt_dataset(url: str, cache_dir: Path, refresh: bool) -> Path:
+    ensure_dir(cache_dir)
+    parsed = urlparse(url)
+    filename = Path(parsed.path).name or "prompt_dataset.txt"
+    cache_path = cache_dir / filename
+    if cache_path.exists() and not refresh:
+        print(f"[+] Reusing cached prompt dataset at {cache_path}")
+        return cache_path
+
+    print(f"[+] Downloading prompt dataset from {url}")
+    with urllib.request.urlopen(url) as response:
+        data = response.read()
+    cache_path.write_bytes(data)
+    return cache_path
+
+
+def detect_prompt_format(path: Path, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    suffix = path.suffix.lower()
+    if suffix in (".jsonl", ".ndjson"):
+        return "jsonl"
+    if suffix == ".json":
+        return "json"
+    return "txt"
+
+
+def _coerce_prompt(entry, field: str | None) -> str | None:
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict) and field:
+        value = entry.get(field)
+        if isinstance(value, str):
+            return value.strip()
+    return None
+
+
+def parse_prompt_dataset(path: Path, fmt: str, field: str, limit: int) -> List[str]:
+    if fmt == "txt":
+        prompts = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    elif fmt == "json":
+        raw = json.loads(path.read_text())
+        if isinstance(raw, dict):
+            field_value = raw.get(field)
+            if isinstance(field_value, list):
+                raw = field_value
+            else:
+                raw = raw.get("prompts", [])
+        prompts = []
+        for entry in raw if isinstance(raw, list) else []:
+            prompt = _coerce_prompt(entry, field)
+            if prompt:
+                prompts.append(prompt)
+    elif fmt == "jsonl":
+        prompts = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            prompt = _coerce_prompt(entry, field)
+            if prompt:
+                prompts.append(prompt)
+    else:
+        raise ValueError(f"Unsupported prompt dataset format: {fmt}")
+
+    if not prompts:
+        raise ValueError(f"No prompts could be extracted from {path} using format '{fmt}'.")
+    if limit > 0:
+        return prompts[:limit]
+    return prompts
+
+
+def resolve_text_prompts(args: argparse.Namespace) -> List[str]:
+    if args.prompt_dataset_url:
+        dataset_path = download_prompt_dataset(args.prompt_dataset_url, args.prompt_dataset_cache_dir, args.prompt_dataset_refresh)
+        dataset_format = detect_prompt_format(dataset_path, args.prompt_dataset_format)
+        prompts = parse_prompt_dataset(dataset_path, dataset_format, args.prompt_dataset_field, args.num_prompts)
+        if len(prompts) < args.num_prompts:
+            print(f"[!] Only {len(prompts)} prompts available from dataset; requested {args.num_prompts}.")
+        return prompts
+    return load_prompts(args.prompts, args.num_prompts)
 
 
 def parse_class_ids(
@@ -265,7 +359,7 @@ def main() -> None:
     pipe.set_progress_bar_config(disable=True)
 
     if args.conditioning == "text":
-        condition_items = load_prompts(args.prompts, args.num_prompts)
+        condition_items = resolve_text_prompts(args)
     else:
         id2label = getattr(pipe.config, "id2label", None)
         condition_items = parse_class_ids(args.class_ids, args.num_prompts, id2label)

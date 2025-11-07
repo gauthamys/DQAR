@@ -2,17 +2,25 @@
   {
     "name": "baseline",
     "samples": 5,
-    "avg_time_s": 0.010643816739320754,
-    "std_time_s": 0.0005067522749872542,
+    "avg_time_s": 0.00999676645733416,
+    "std_time_s": 0.00022064378019083825,
     "avg_reuse": 0,
-    "avg_rss_mb": 23.465625
+    "avg_rss_mb": 23.41875
+  },
+  {
+    "name": "static",
+    "samples": 5,
+    "avg_time_s": 0.007695725047960877,
+    "std_time_s": 0.00016389062655531553,
+    "avg_reuse": 62,
+    "avg_rss_mb": 23.796875
   },
   {
     "name": "dqar",
     "samples": 5,
-    "avg_time_s": 0.008131116768345237,
-    "std_time_s": 0.00022614160197306757,
+    "avg_time_s": 0.012710650265216828,
+    "std_time_s": 0.009785333222873834,
     "avg_reuse": 62,
-    "avg_rss_mb": 23.846875
+    "avg_rss_mb": 23.828125
   }
 ]

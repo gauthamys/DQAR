@@ -62,6 +62,19 @@ python scripts/benchmark_dqar.py \
 
 Text-conditioned models (PixArt/Sdxl) can keep `--conditioning text` and pass `--prompts`. For class-conditional checkpoints, omit `--class-ids` to let the script pick the first `num-prompts` entries from `id2label`.
 
+To benchmark with a shared prompt set, point the script at any HTTP(S) file containing prompts (newline-delimited `.txt`, array-based `.json`, or `.jsonl` with a `prompt` column):
+
+```bash
+python scripts/benchmark_dqar.py \
+  --conditioning text \
+  --prompt-dataset-url https://huggingface.co/datasets/poloclub/diffusiondb/resolve/main/sample_prompts.jsonl \
+  --prompt-dataset-format jsonl \
+  --prompt-dataset-field prompt \
+  --num-prompts 64
+```
+
+The downloaded file is cached under `prompt_datasets/` (override with `--prompt-dataset-cache-dir`), and you can force a refresh via `--prompt-dataset-refresh`.
+
 Outputs per run:
 
 - `benchmark_outputs/baseline/` and `benchmark_outputs/dqar/` image dumps (optional).

@@ -27,7 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--entropy-threshold", type=float, default=1.5)
-    parser.add_argument("--min-prob", type=float, default=0.4)
+    parser.add_argument("--min-prob", type=float, default=0.0)
+    parser.add_argument("--static-max-gap", type=int, default=12, help="Max gap for static reuse scheduling.")
+    parser.add_argument("--static-max-reuse", type=int, default=100, help="Max reuse per block for static scheduling.")
     parser.add_argument("--output", type=Path, default=Path("dummy_benchmark.json"))
     return parser.parse_args()
 
@@ -66,45 +68,72 @@ def summarize(name: str, timings: list[float], reuse_counts: list[int], mem_byte
     }
 
 
+def _benchmark_scenario(name: str, model: DummyDiffusionTransformer, controller_factory, args: argparse.Namespace) -> dict:
+    timings = []
+    reuse_counts = []
+    mem_usages = []
+    for _ in range(args.runs):
+        controller = controller_factory()
+        elapsed, output, mem = run_once(model, controller, args)
+        timings.append(elapsed)
+        reuse_counts.append(output.reuse_events)
+        mem_usages.append(mem)
+    return summarize(name, timings, reuse_counts, mem_usages)
+
+
+def _make_static_config(args: argparse.Namespace) -> DQARConfig:
+    config = DQARConfig()
+    config.gate.min_step = 0
+    config.gate.entropy_threshold = 1e9
+    config.gate.min_probability = 0.0
+    config.gate.snr_range = (0.0, 1e9)
+    config.gate.cooldown_steps = 0
+    config.scheduler.max_gap = args.static_max_gap
+    config.scheduler.max_reuse_per_block = args.static_max_reuse
+    return config
+
+
+def _make_dqar_config(args: argparse.Namespace) -> DQARConfig:
+    config = DQARConfig()
+    config.gate.entropy_threshold = args.entropy_threshold
+    config.gate.min_probability = args.min_prob
+    config.gate.min_step = 0
+    config.gate.cooldown_steps = 0
+    config.scheduler.max_gap = max(config.scheduler.max_gap, args.static_max_gap)
+    config.scheduler.max_reuse_per_block = max(
+        config.scheduler.max_reuse_per_block,
+        args.static_max_reuse,
+    )
+    return config
+
+
 def main() -> None:
     args = parse_args()
     model = DummyDiffusionTransformer(num_layers=args.layers)
 
-    baseline_times = []
-    baseline_reuse = []
-    baseline_mem = []
-    for run_idx in range(args.runs):
-        controller = DQARController(num_layers=args.layers)
-        elapsed, output, mem = run_once(model, controller, args)
-        baseline_times.append(elapsed)
-        baseline_reuse.append(output.reuse_events)
-        baseline_mem.append(mem)
+    baseline = _benchmark_scenario(
+        "baseline",
+        model,
+        controller_factory=lambda: DQARController(num_layers=args.layers),
+        args=args,
+    )
+    static = _benchmark_scenario(
+        "static",
+        model,
+        controller_factory=lambda: DQARController(num_layers=args.layers, config=_make_static_config(args)),
+        args=args,
+    )
+    dqar = _benchmark_scenario(
+        "dqar",
+        model,
+        controller_factory=lambda: DQARController(num_layers=args.layers, config=_make_dqar_config(args)),
+        args=args,
+    )
 
-    config = DQARConfig()
-    config.gate.min_step = 0
-    config.gate.entropy_threshold = 10.0  # effectively disable entropy gate
-    config.gate.min_probability = 0.0
-    config.gate.snr_range = (0.0, 1e6)
-    config.gate.cooldown_steps = 0
-    config.scheduler.max_gap = 12
-    config.scheduler.max_reuse_per_block = 100
-    dqar_times = []
-    dqar_reuse = []
-    dqar_mem = []
-    for run_idx in range(args.runs):
-        controller = DQARController(num_layers=args.layers, config=config)
-        elapsed, output, mem = run_once(model, controller, args)
-        dqar_times.append(elapsed)
-        dqar_reuse.append(output.reuse_events)
-        dqar_mem.append(mem)
-
-    summary = [
-        summarize("baseline", baseline_times, baseline_reuse, baseline_mem),
-        summarize("dqar", dqar_times, dqar_reuse, dqar_mem),
-    ]
+    summary = [baseline, static, dqar]
     args.output.write_text(json.dumps(summary, indent=2))
-    print("Baseline:", summary[0])
-    print("DQAR:", summary[1])
+    for entry in summary:
+        print(f"{entry['name'].title()}:", entry)
     print(f"Wrote results to {args.output}")
 
 
