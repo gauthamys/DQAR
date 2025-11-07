@@ -18,7 +18,7 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import torch
@@ -33,8 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", default="fp16", help="Checkpoint variant to load (fp16/bf16/full).")
     parser.add_argument("--dtype", default="fp16", choices=("fp16", "bf16", "fp32"))
     parser.add_argument("--device", default="cuda", help="'cuda' or 'cpu'.")
+    parser.add_argument("--conditioning", choices=("text", "class"), default="text")
     parser.add_argument("--prompts", type=Path, help="Optional text file (one prompt per line).")
-    parser.add_argument("--num-prompts", type=int, default=4, help="Fallback prompt count if no file supplied.")
+    parser.add_argument("--class-ids", help="Comma-separated class ids or path to file (one id per line).")
+    parser.add_argument("--num-prompts", type=int, default=4, help="Fallback prompt count / class count.")
     parser.add_argument("--steps", type=int, default=30, help="Number of inference steps.")
     parser.add_argument("--guidance", type=float, default=7.5, help="CFG guidance scale.")
     parser.add_argument("--height", type=int, default=256)
@@ -68,6 +70,41 @@ def load_prompts(path: Path | None, count: int) -> List[str]:
         return defaults[:count]
     extra = [f"Abstract geometry #{i}" for i in range(count - len(defaults))]
     return defaults + extra
+
+
+def parse_class_ids(
+    raw_ids: str | None,
+    count: int,
+    id2label: Dict[str, str] | None,
+) -> List[Tuple[int, str]]:
+    def _parse_line(line: str) -> Tuple[int, str]:
+        parts = [p.strip() for p in line.split(",", 1)]
+        idx = int(parts[0])
+        label = parts[1] if len(parts) > 1 else (id2label.get(str(idx), f"class_{idx}") if id2label else f"class_{idx}")
+        return idx, label
+
+    if raw_ids:
+        path = Path(raw_ids)
+        if path.exists():
+            entries = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+        else:
+            entries = [token.strip() for token in raw_ids.split(",") if token.strip()]
+        parsed = [_parse_line(entry) for entry in entries]
+        return parsed
+
+    if id2label:
+        numeric_keys = []
+        for key in id2label.keys():
+            try:
+                numeric_keys.append(int(key))
+            except ValueError:
+                continue
+        sorted_ids = sorted(numeric_keys)
+        selected = sorted_ids[:count]
+        return [(idx, id2label.get(str(idx), f"class_{idx}")) for idx in selected]
+
+    # fallback synthetic classes
+    return [(i, f"class_{i}") for i in range(count)]
 
 
 def slugify(text: str) -> str:
@@ -123,7 +160,7 @@ def ensure_dir(path: Path) -> None:
 
 def run_pass(
     pipe: DiTPipeline,
-    prompts: Sequence[str],
+    condition_items: Sequence,
     args: argparse.Namespace,
     *,
     use_dqar: bool,
@@ -150,9 +187,8 @@ def run_pass(
 
     gen = torch.Generator(device=device).manual_seed(args.seed)
 
-    for idx, prompt in enumerate(prompts):
+    for idx, item in enumerate(condition_items):
         kwargs = dict(
-            prompt=prompt,
             num_inference_steps=args.steps,
             guidance_scale=args.guidance,
             height=args.height,
@@ -161,6 +197,14 @@ def run_pass(
             generator=gen.manual_seed(args.seed + idx),
             output_type="pil",
         )
+        label_for_name = ""
+        if args.conditioning == "text":
+            kwargs["prompt"] = item
+            label_for_name = item
+        else:
+            class_id, class_name = item
+            kwargs["class_labels"] = torch.tensor([class_id], device=device)
+            label_for_name = class_name
         if use_dqar:
             kwargs["controller"] = dqar_controller
 
@@ -173,7 +217,7 @@ def run_pass(
 
         if not args.skip_images:
             for img_idx, image in enumerate(result.images):
-                filename = f"{idx:02d}-{img_idx:02d}-{slugify(prompt)}.png"
+                filename = f"{idx:02d}-{img_idx:02d}-{slugify(label_for_name)}.png"
                 image.save(out_dir / filename)
 
     if device.type == "cuda":
@@ -208,7 +252,6 @@ def plot_results(results: Sequence[RunStats], path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    prompts = load_prompts(args.prompts, args.num_prompts)
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
@@ -221,10 +264,16 @@ def main() -> None:
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
 
+    if args.conditioning == "text":
+        condition_items = load_prompts(args.prompts, args.num_prompts)
+    else:
+        id2label = getattr(pipe.config, "id2label", None)
+        condition_items = parse_class_ids(args.class_ids, args.num_prompts, id2label)
+
     ensure_dir(args.output_dir)
 
-    baseline = run_pass(pipe, prompts, args, use_dqar=False)
-    dqar = run_pass(pipe, prompts, args, use_dqar=True)
+    baseline = run_pass(pipe, condition_items, args, use_dqar=False)
+    dqar = run_pass(pipe, condition_items, args, use_dqar=True)
 
     summaries = [summarize("baseline", baseline), summarize("dqar", dqar)]
     args.save_json.write_text(json.dumps(summaries, indent=2))

@@ -45,13 +45,15 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install diffusers transformers accelerate matplotlib
 python scripts/benchmark_dqar.py \
   --model facebook/DiT-XL-2-256 \
-  --variant fp16 \
   --dtype fp16 \
   --steps 30 \
   --guidance 7.5 \
-  --prompts prompts.txt \
+  --conditioning class \
+  --class-ids 207,233,472,898 \
   --output-dir outputs/dit-xl
 ```
+
+Text-conditioned models (PixArt/Sdxl) can keep `--conditioning text` and pass `--prompts`. For class-conditional checkpoints, omit `--class-ids` to let the script pick the first `num-prompts` entries from `id2label`.
 
 Outputs per run:
 
