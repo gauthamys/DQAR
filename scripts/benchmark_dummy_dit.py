@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-prob", type=float, default=0.0)
     parser.add_argument("--static-max-gap", type=int, default=12, help="Max gap for static reuse scheduling.")
     parser.add_argument("--static-max-reuse", type=int, default=100, help="Max reuse per block for static scheduling.")
+    parser.add_argument("--dqar-max-gap", type=int, default=6, help="Max gap for adaptive DQAR scheduling.")
+    parser.add_argument("--dqar-max-reuse", type=int, default=6, help="Max reuse per block for adaptive scheduling.")
     parser.add_argument("--output", type=Path, default=Path("dummy_benchmark.json"))
     return parser.parse_args()
 
@@ -99,11 +101,8 @@ def _make_dqar_config(args: argparse.Namespace) -> DQARConfig:
     config.gate.min_probability = args.min_prob
     config.gate.min_step = 0
     config.gate.cooldown_steps = 0
-    config.scheduler.max_gap = max(config.scheduler.max_gap, args.static_max_gap)
-    config.scheduler.max_reuse_per_block = max(
-        config.scheduler.max_reuse_per_block,
-        args.static_max_reuse,
-    )
+    config.scheduler.max_gap = args.dqar_max_gap
+    config.scheduler.max_reuse_per_block = args.dqar_max_reuse
     return config
 
 

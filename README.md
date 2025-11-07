@@ -75,6 +75,28 @@ python scripts/benchmark_dqar.py \
 
 The downloaded file is cached under `prompt_datasets/` (override with `--prompt-dataset-cache-dir`), and you can force a refresh via `--prompt-dataset-refresh`.
 
+## Dummy model sweep results
+
+The dummy harness now has a sweep utility that scans entropy thresholds and reuse budgets while recording runtime, RSS, and reuse counts for the baseline, static reuse, and DQAR controllers:
+
+```bash
+source .venv/bin/activate  # optional, but needed if you installed matplotlib locally
+python scripts/dummy_benchmark_sweep.py \
+  --thresholds 1.5,3.0,5.0 \
+  --reuse-limits 2,4,6 \
+  --dqar-max-gap 6 \
+  --runs 5
+```
+
+This produces two artifacts at the repo root:
+
+- `dummy_benchmark_sweep.json` – structured trace of every benchmark call.
+- `dummy_benchmark_sweep.png` – line plot summarizing runtime, RSS, and reuse trends.
+
+![Dummy benchmark sweep](dummy_benchmark_sweep.png)
+
+The figure below illustrates that static reuse (gray) consistently hits the maximum number of reuse events but also maintains a slightly higher RSS. DQAR (blue) approaches that reuse rate only when both the entropy threshold and reuse budget increase, at the expense of marginally higher runtime. Baseline (orange) serves as a sanity check and remains flat across the grid.
+
 Outputs per run:
 
 - `benchmark_outputs/baseline/` and `benchmark_outputs/dqar/` image dumps (optional).
