@@ -1,0 +1,9 @@
+
+[dev]
+pytest
+ruff
+
+[torch]
+torch
+diffusers
+transformers

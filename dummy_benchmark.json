@@ -1,0 +1,18 @@
+[
+  {
+    "name": "baseline",
+    "samples": 5,
+    "avg_time_s": 0.010643816739320754,
+    "std_time_s": 0.0005067522749872542,
+    "avg_reuse": 0,
+    "avg_rss_mb": 23.465625
+  },
+  {
+    "name": "dqar",
+    "samples": 5,
+    "avg_time_s": 0.008131116768345237,
+    "std_time_s": 0.00022614160197306757,
+    "avg_reuse": 62,
+    "avg_rss_mb": 23.846875
+  }
+]

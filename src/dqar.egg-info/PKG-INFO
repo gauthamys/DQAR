@@ -1,3 +1,18 @@
+Metadata-Version: 2.4
+Name: dqar
+Version: 0.1.0
+Summary: Dynamic and Quantization-Aware Attention Reuse for Diffusion Transformers
+Author: Gautham Satyanarayana
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: torch
+Requires-Dist: torch; extra == "torch"
+Requires-Dist: diffusers; extra == "torch"
+Requires-Dist: transformers; extra == "torch"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+
 # Dynamic and Quantization-Aware Attention Reuse (DQAR)
 
 DQAR unifies the attention reuse techniques introduced in **DiTFastAttn** (NeurIPS 2024) with the post-training quantization strategies from **PTQ4DiT** to form an adaptive inference controller for Diffusion Transformers (DiTs). The accompanying project proposal (CS494) outlines the desired features:
