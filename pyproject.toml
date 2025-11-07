@@ -1,0 +1,19 @@
+[project]
+name = "dqar"
+version = "0.1.0"
+description = "Dynamic and Quantization-Aware Attention Reuse for Diffusion Transformers"
+authors = [{name = "Gautham Satyanarayana"}]
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = []
+
+[project.optional-dependencies]
+torch = ["torch", "diffusers", "transformers"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
