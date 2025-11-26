@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -22,20 +23,34 @@ class QuantizationConfig:
 class ReuseGateConfig:
     """Heuristics and thresholds for entropy/SNR driven reuse."""
 
-    entropy_threshold: float = 1.3
-    prompt_length_scale: float = 0.012
-    snr_range: Tuple[float, float] = (0.25, 64.0)
-    min_step: int = 4
-    cooldown_steps: int = 2
-    min_probability: float = 0.55
+    entropy_threshold: float = 2.5
+    prompt_length_scale: float = 0.015
+    snr_range: Tuple[float, float] = (0.1, 100.0)
+    min_step: int = 3
+    cooldown_steps: int = 1
+    min_probability: float = 0.5
     eps: float = 1e-6
 
     def adaptive_entropy_threshold(self, prompt_length: int) -> float:
-        # Longer prompts typically push attention to be sharper; lower the bar slightly.
-        return max(
-            self.eps,
-            self.entropy_threshold - self.prompt_length_scale * float(max(prompt_length - 16, 0)),
-        )
+        """
+        Compute prompt-length adaptive entropy threshold.
+
+        Longer prompts tend to have more stable, sharper attention distributions
+        (lower entropy) because there's more context for the model to attend to.
+        Therefore, we INCREASE the threshold for longer prompts to allow more
+        reuse opportunities when attention is naturally more focused.
+
+        Formula: threshold = base + scale * sqrt(prompt_length / 16)
+
+        This uses sqrt scaling to provide diminishing returns for very long prompts.
+        """
+        # Base threshold for short prompts (<=16 tokens)
+        base = self.entropy_threshold
+        # Scale factor increases threshold for longer prompts
+        length_factor = math.sqrt(max(prompt_length, 1) / 16.0)
+        adjusted = base * length_factor
+        # Clamp to reasonable range [eps, 2 * base]
+        return max(self.eps, min(adjusted, 2.0 * base))
 
 
 @dataclass(slots=True)

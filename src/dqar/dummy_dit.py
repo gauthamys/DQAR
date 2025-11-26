@@ -3,16 +3,18 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional
 
 from .controller import DQARController
 
 
 def _make_matrix(rows: int, cols: int) -> List[List[float]]:
+    """Create a random matrix."""
     return [[random.uniform(-1.0, 1.0) for _ in range(cols)] for _ in range(rows)]
 
 
 def _make_attention(heads: int, tokens: int) -> List[List[List[float]]]:
+    """Create a random attention map with valid softmax distribution."""
     attn: List[List[List[float]]] = []
     for _ in range(heads):
         head_rows: List[List[float]] = []
@@ -24,19 +26,27 @@ def _make_attention(heads: int, tokens: int) -> List[List[List[float]]]:
     return attn
 
 
-def _noisy(latent: Sequence[float], noise_scale: float = 0.05) -> List[float]:
+def _noisy(latent: List[float], noise_scale: float = 0.05) -> List[float]:
+    """Add noise to latent."""
     return [value + random.uniform(-noise_scale, noise_scale) for value in latent]
 
 
 @dataclass(slots=True)
 class DummyDiffusionOutput:
+    """Output from dummy diffusion generation."""
     latents: List[float]
     reuse_events: int
     recompute_events: int
 
 
 class DummyDiffusionTransformer:
-    """Small stand-in for a DiT that exercises the DQAR controller hooks."""
+    """
+    Small stand-in for a DiT that exercises the DQAR controller hooks.
+
+    This class simulates a diffusion transformer for testing purposes,
+    generating random attention maps and latents to exercise all DQAR
+    controller code paths.
+    """
 
     def __init__(
         self,
@@ -45,6 +55,15 @@ class DummyDiffusionTransformer:
         latent_dim: int = 16,
         heads: int = 2,
     ):
+        """
+        Initialize the dummy transformer.
+
+        Args:
+            num_layers: Number of transformer layers to simulate.
+            tokens: Number of tokens per sequence.
+            latent_dim: Dimensionality of the latent space.
+            heads: Number of attention heads per layer.
+        """
         self.num_layers = num_layers
         self.tokens = tokens
         self.latent_dim = latent_dim
@@ -59,6 +78,19 @@ class DummyDiffusionTransformer:
         seed: int = 7,
         branch: str = "cond",
     ) -> DummyDiffusionOutput:
+        """
+        Run dummy diffusion generation with DQAR controller.
+
+        Args:
+            controller: DQAR controller instance (created if None).
+            steps: Number of diffusion steps.
+            prompt_length: Simulated prompt length for adaptive thresholds.
+            seed: Random seed for reproducibility.
+            branch: CFG branch to use ("cond" or "uncond").
+
+        Returns:
+            DummyDiffusionOutput with final latents and reuse statistics.
+        """
         random.seed(seed)
         controller = controller or DQARController(num_layers=self.num_layers)
         reuse_events = 0
@@ -66,13 +98,13 @@ class DummyDiffusionTransformer:
         latents = [random.uniform(-1.0, 1.0) for _ in range(self.latent_dim)]
 
         for step in range(steps):
-            snr = math.exp(-0.15 * step) * 5.0
+            # Begin step - SNR is now estimated from timestep automatically
+            latent_norm = math.sqrt(sum(value * value for value in latents))
             controller.begin_step(
                 step_index=step,
                 total_steps=steps,
-                snr=snr,
                 prompt_length=prompt_length,
-                latent_norm=math.sqrt(sum(value * value for value in latents)),
+                latent_norm=latent_norm,
             )
 
             for layer_idx in range(self.num_layers):
@@ -87,30 +119,26 @@ class DummyDiffusionTransformer:
                     reuse_events += 1
                     continue
 
+                # Compute fresh attention
                 attn_map = _make_attention(self.heads, self.tokens)
                 keys = _make_matrix(self.tokens, self.latent_dim)
                 values = _make_matrix(self.tokens, self.latent_dim)
-                clean_latent = list(latents)
-                noisy_latent = _noisy(latents)
-                residual = [
-                    noisy - clean
-                    for clean, noisy in zip(clean_latent, noisy_latent)
-                ]
+                residual = [random.uniform(-0.05, 0.05) for _ in range(self.latent_dim)]
 
+                # Commit to cache using new API
                 controller.commit(
                     layer_id=layer_idx,
                     branch=branch,
                     attn_map=attn_map,
                     keys=keys,
                     values=values,
-                    clean_latent=clean_latent,
-                    noisy_latent=noisy_latent,
+                    latent=latents,  # Current latent for norm computation
                     residual=residual,
                     prompt_length=prompt_length,
                 )
                 recompute_events += 1
 
-                # simple latent update to keep numbers moving
+                # Update latent
                 latents = [value + delta for value, delta in zip(latents, residual)]
 
         return DummyDiffusionOutput(

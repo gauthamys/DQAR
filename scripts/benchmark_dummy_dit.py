@@ -60,13 +60,17 @@ def run_once(model: DummyDiffusionTransformer, controller: DQARController, args:
 
 
 def summarize(name: str, timings: list[float], reuse_counts: list[int], mem_bytes: list[int]) -> dict:
+    mem_mb = [m / (1024 * 1024) for m in mem_bytes]
+    n = len(timings)
     return {
         "name": name,
-        "samples": len(timings),
+        "samples": n,
         "avg_time_s": mean(timings),
-        "std_time_s": pstdev(timings) if len(timings) > 1 else 0.0,
+        "std_time_s": pstdev(timings) if n > 1 else 0.0,
         "avg_reuse": mean(reuse_counts),
-        "avg_rss_mb": mean(mem_bytes) / (1024 * 1024),
+        "std_reuse": pstdev(reuse_counts) if n > 1 else 0.0,
+        "avg_rss_mb": mean(mem_mb),
+        "std_rss_mb": pstdev(mem_mb) if n > 1 else 0.0,
     }
 
 

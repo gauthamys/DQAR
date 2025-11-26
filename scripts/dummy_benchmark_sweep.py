@@ -66,8 +66,11 @@ def collect_data(thresholds: list[float], reuse_limits: list[int], gap: int, run
                     "max_reuse": reuse_limit,
                     "scenario": entry["name"],
                     "avg_time_s": entry["avg_time_s"],
+                    "std_time_s": entry.get("std_time_s", 0.0),
                     "avg_rss_mb": entry["avg_rss_mb"],
+                    "std_rss_mb": entry.get("std_rss_mb", 0.0),
                     "avg_reuse": entry["avg_reuse"],
+                    "std_reuse": entry.get("std_reuse", 0.0),
                 }
             )
     return records
@@ -78,17 +81,20 @@ def plot_metrics(records: list[dict], thresholds: list[float], reuse_limits: lis
     combo_labels = [f"T{thr:g}|R{reuse}" for thr, reuse in combos]
     x = list(range(len(combos)))
     scenarios = ["baseline", "static", "dqar"]
+    # Map metric key to (mean_key, std_key, title)
     metrics = [
-        ("avg_time_s", "Average Runtime (s)"),
-        ("avg_rss_mb", "Average RSS (MB)"),
-        ("avg_reuse", "Average Reuse Events"),
+        ("avg_time_s", "std_time_s", "Average Runtime (s)"),
+        ("avg_rss_mb", "std_rss_mb", "Average RSS (MB)"),
+        ("avg_reuse", "std_reuse", "Average Reuse Events"),
     ]
+    colors = {"baseline": "#1f77b4", "static": "#ff7f0e", "dqar": "#2ca02c"}
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    for metric_idx, (metric_key, title) in enumerate(metrics):
+    for metric_idx, (mean_key, std_key, title) in enumerate(metrics):
         ax = axes[metric_idx]
         for scenario in scenarios:
             values = []
+            errors = []
             for thr, reuse in combos:
                 match = next(
                     (
@@ -98,8 +104,12 @@ def plot_metrics(records: list[dict], thresholds: list[float], reuse_limits: lis
                     ),
                     None,
                 )
-                values.append(match[metric_key] if match else float("nan"))
-            ax.plot(x, values, marker="o", label=scenario.title())
+                values.append(match[mean_key] if match else float("nan"))
+                errors.append(match.get(std_key, 0.0) if match else 0.0)
+            ax.errorbar(
+                x, values, yerr=errors, marker="o", capsize=3,
+                label=scenario.title(), color=colors.get(scenario),
+            )
         ax.set_title(title)
         ax.set_xticks(x)
         ax.set_xticklabels(combo_labels, rotation=45, ha="right")

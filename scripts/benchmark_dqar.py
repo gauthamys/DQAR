@@ -2,10 +2,13 @@
 """
 Benchmark baseline DiT sampling vs. DQAR-enabled sampling.
 
-The script expects that your DiTPipeline (or custom sampler) accepts an optional
-`controller` keyword argument and will invoke the DQAR controller hooks
-(`begin_step`, `should_reuse`, `commit`, …) internally. The stock diffusers
-pipeline does not yet do this; see README for wiring details.
+This script uses DQAR's patch_dit_pipeline() to automatically wire the
+DQAR controller hooks into HuggingFace DiTPipeline. The patched pipeline
+accepts an optional `controller` keyword argument that enables entropy-gated
+attention reuse.
+
+Usage:
+    PYTHONPATH=src python scripts/benchmark_dqar.py --model facebook/DiT-XL-2-256
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import urllib.request
 from diffusers import DiTPipeline
 from urllib.parse import urlparse
 
-from dqar import DQARConfig, DQARController
+from dqar import DQARConfig, DQARController, patch_dit_pipeline, get_dit_layer_count
 
 
 def parse_args() -> argparse.Namespace:
@@ -265,9 +268,16 @@ def run_pass(
     dqar_controller = None
 
     if use_dqar:
-        if not hasattr(pipe, "transformer"):
-            raise ValueError("Pipeline does not expose a `.transformer` module for DQAR.")
-        num_layers = len(getattr(pipe.transformer, "blocks", []))
+        # Use DQAR helper to get layer count, with fallback
+        if get_dit_layer_count is not None:
+            try:
+                num_layers = get_dit_layer_count(pipe)
+            except (ValueError, AttributeError):
+                num_layers = len(getattr(pipe.transformer, "blocks", []))
+        else:
+            if not hasattr(pipe, "transformer"):
+                raise ValueError("Pipeline does not expose a `.transformer` module for DQAR.")
+            num_layers = len(getattr(pipe.transformer, "blocks", []))
         if num_layers == 0:
             raise ValueError("Unable to infer transformer block count; patch integration first.")
         dqar_controller = DQARController(num_layers=num_layers, config=build_dqar_config(args))
@@ -357,6 +367,12 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
+
+    # Patch pipeline for DQAR integration
+    if patch_dit_pipeline is not None:
+        pipe = patch_dit_pipeline(pipe)
+    else:
+        print("[!] Warning: DQAR DiT wrapper not available, controller will be ignored")
 
     if args.conditioning == "text":
         condition_items = resolve_text_prompts(args)
