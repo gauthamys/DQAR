@@ -184,20 +184,112 @@ class DQARAttentionWrapper:
         )
 
 
-def patch_dit_pipeline(pipe: "DiTPipeline") -> "DiTPipeline":
+class DQARPipelineWrapper:
+    """
+    Wrapper class for DiTPipeline that adds DQAR controller support.
+
+    This wrapper intercepts calls to the pipeline and manages the DQAR
+    controller lifecycle, setting it on attention wrappers before inference
+    and clearing it afterwards.
+    """
+
+    def __init__(self, pipe: "DiTPipeline", wrappers: list):
+        self._pipe = pipe
+        self._dqar_wrappers = wrappers
+        self._dqar_num_layers = len(wrappers)
+        self._active_controller = None
+
+        # Copy commonly accessed attributes from the wrapped pipeline
+        self.transformer = pipe.transformer
+        self.scheduler = pipe.scheduler
+        self.vae = getattr(pipe, 'vae', None)
+        self.config = getattr(pipe, 'config', None)
+
+    def __getattr__(self, name: str):
+        """Delegate attribute access to the wrapped pipeline."""
+        return getattr(self._pipe, name)
+
+    def __call__(
+        self,
+        *args,
+        controller: Optional["DQARController"] = None,
+        **kwargs,
+    ):
+        """
+        Call the pipeline with optional DQAR controller.
+
+        Args:
+            *args: Positional arguments passed to the pipeline.
+            controller: Optional DQARController for attention reuse.
+            **kwargs: Keyword arguments passed to the pipeline.
+
+        Returns:
+            Pipeline output (typically images).
+        """
+        # Extract DQAR-specific kwargs
+        branch = kwargs.pop('dqar_branch', 'cond')
+
+        # Set controller on all wrappers
+        for wrapper in self._dqar_wrappers:
+            wrapper.set_controller(controller, branch=branch)
+
+        self._active_controller = controller
+
+        try:
+            # Add callback for step updates if controller provided
+            if controller is not None:
+                original_callback = kwargs.get('callback_on_step_end')
+
+                def step_callback(pipe, step_idx, timestep, callback_kwargs):
+                    if self._active_controller:
+                        num_steps = kwargs.get('num_inference_steps', 50)
+                        # For class-conditional models, use a default prompt length
+                        prompt_length = 16
+                        if 'prompt' in kwargs and kwargs['prompt']:
+                            prompt_length = len(str(kwargs['prompt']).split())
+                        self._active_controller.begin_step(
+                            step_index=step_idx,
+                            total_steps=num_steps,
+                            prompt_length=prompt_length,
+                        )
+                    if original_callback:
+                        return original_callback(pipe, step_idx, timestep, callback_kwargs)
+                    return callback_kwargs
+
+                kwargs['callback_on_step_end'] = step_callback
+
+            # Call the underlying pipeline
+            return self._pipe(*args, **kwargs)
+        finally:
+            # Clear controller references
+            for wrapper in self._dqar_wrappers:
+                wrapper.set_controller(None)
+            self._active_controller = None
+
+    def to(self, device):
+        """Move pipeline to device."""
+        self._pipe = self._pipe.to(device)
+        return self
+
+    def set_progress_bar_config(self, **kwargs):
+        """Configure progress bar."""
+        self._pipe.set_progress_bar_config(**kwargs)
+
+
+def patch_dit_pipeline(pipe: "DiTPipeline") -> "DQARPipelineWrapper":
     """
     Patch a DiTPipeline to support DQAR controller integration.
 
     This function:
     1. Wraps each attention layer with DQARAttentionWrapper
-    2. Modifies the pipeline's __call__ to accept a controller argument
+    2. Returns a wrapper that accepts a controller argument
     3. Hooks step callbacks to update controller state
 
     Args:
         pipe: A DiTPipeline instance from HuggingFace diffusers.
 
     Returns:
-        The patched pipeline (same instance, modified in-place).
+        A DQARPipelineWrapper that wraps the original pipeline.
 
     Raises:
         ImportError: If torch/diffusers are not installed.
@@ -234,67 +326,24 @@ def patch_dit_pipeline(pipe: "DiTPipeline") -> "DiTPipeline":
     if not wrappers:
         raise ValueError("No attention layers found to wrap")
 
-    # Store wrappers on pipeline for access
-    pipe._dqar_wrappers = wrappers
-    pipe._dqar_num_layers = len(wrappers)
-
-    # Patch the __call__ method
-    original_call = pipe.__class__.__call__
-
-    @wraps(original_call)
-    def patched_call(
-        self,
-        *args,
-        controller: Optional["DQARController"] = None,
-        **kwargs,
-    ):
-        # Set controller on all wrappers
-        branch = kwargs.pop('dqar_branch', 'cond')
-        for wrapper in getattr(self, '_dqar_wrappers', []):
-            wrapper.set_controller(controller, branch=branch)
-
-        # Store controller for step callback
-        self._active_controller = controller
-
-        try:
-            # Add callback for step updates
-            if controller is not None:
-                original_callback = kwargs.get('callback_on_step_end')
-
-                def step_callback(pipe, step_idx, timestep, callback_kwargs):
-                    if self._active_controller:
-                        num_steps = kwargs.get('num_inference_steps', 50)
-                        prompt_length = len(kwargs.get('prompt', '').split()) if 'prompt' in kwargs else 16
-                        self._active_controller.begin_step(
-                            step_index=step_idx,
-                            total_steps=num_steps,
-                            prompt_length=prompt_length,
-                        )
-                    if original_callback:
-                        return original_callback(pipe, step_idx, timestep, callback_kwargs)
-                    return callback_kwargs
-
-                kwargs['callback_on_step_end'] = step_callback
-
-            return original_call(self, *args, **kwargs)
-        finally:
-            # Clear controller references
-            for wrapper in getattr(self, '_dqar_wrappers', []):
-                wrapper.set_controller(None)
-            self._active_controller = None
-
-    # Bind the patched method
-    import types
-    pipe.__call__ = types.MethodType(patched_call, pipe)
-
+    # Create and return wrapper
+    wrapped = DQARPipelineWrapper(pipe, wrappers)
     print(f"[DQAR] Patched pipeline with {len(wrappers)} attention wrappers")
-    return pipe
+    return wrapped
 
 
-def get_dit_layer_count(pipe: "DiTPipeline") -> int:
-    """Get the number of transformer layers in a DiT pipeline."""
+def get_dit_layer_count(pipe) -> int:
+    """
+    Get the number of transformer layers in a DiT pipeline.
+
+    Works with both original DiTPipeline and DQARPipelineWrapper.
+    """
     if not HAS_TORCH:
         raise ImportError("PyTorch and diffusers required")
+
+    # Check if it's a DQAR wrapper
+    if isinstance(pipe, DQARPipelineWrapper):
+        return pipe._dqar_num_layers
 
     if hasattr(pipe, '_dqar_num_layers'):
         return pipe._dqar_num_layers
@@ -307,4 +356,4 @@ def get_dit_layer_count(pipe: "DiTPipeline") -> int:
     return len(blocks)
 
 
-__all__ = ["patch_dit_pipeline", "get_dit_layer_count", "DQARAttentionWrapper"]
+__all__ = ["patch_dit_pipeline", "get_dit_layer_count", "DQARAttentionWrapper", "DQARPipelineWrapper"]

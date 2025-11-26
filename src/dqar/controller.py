@@ -75,6 +75,10 @@ class DQARController:
         # Layer eligibility window
         self._layer_window = self.scheduler.eligible_layers(0, self.total_steps)
 
+        # Counters for tracking
+        self._total_reuse_count = 0
+        self._total_compute_count = 0
+
     def begin_step(
         self,
         step_index: int,
@@ -219,6 +223,7 @@ class DQARController:
             Tuple of (keys, values, residual) - dequantized tensors.
         """
         self.cache.increment_reuse(entry)
+        self._total_reuse_count += 1
         k = self.quantizer.dequantize(entry.k) if entry.k is not None else None
         v = self.quantizer.dequantize(entry.v)
         residual = self.quantizer.dequantize(entry.residual) if entry.residual else None
@@ -278,6 +283,7 @@ class DQARController:
             branch=branch,
         )
 
+        self._total_compute_count += 1
         return self.cache.store(
             layer_id=layer_id,
             branch=branch,
@@ -288,9 +294,33 @@ class DQARController:
             residual=residual,
         )
 
+    def get_reuse_count(self) -> int:
+        """Get total number of reuse events."""
+        return self._total_reuse_count
+
+    def get_compute_count(self) -> int:
+        """Get total number of fresh computations."""
+        return self._total_compute_count
+
+    def get_stats(self) -> dict:
+        """Get controller statistics."""
+        total = self._total_reuse_count + self._total_compute_count
+        return {
+            "reuse_count": self._total_reuse_count,
+            "compute_count": self._total_compute_count,
+            "total_ops": total,
+            "reuse_rate": self._total_reuse_count / max(total, 1),
+        }
+
+    def reset_stats(self) -> None:
+        """Reset reuse/compute counters."""
+        self._total_reuse_count = 0
+        self._total_compute_count = 0
+
     def clear(self) -> None:
-        """Clear all cached entries."""
+        """Clear all cached entries and reset stats."""
         self.cache.clear()
+        self.reset_stats()
 
 
 __all__ = ["DQARController", "ReuseDecision"]
