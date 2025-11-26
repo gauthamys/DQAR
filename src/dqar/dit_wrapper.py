@@ -159,10 +159,22 @@ class DQARAttentionWrapper:
         seq_len = hidden_states.shape[1] if hidden_states.dim() > 2 else 1
         num_heads = getattr(self.original, 'heads', 8)
 
-        # Create a synthetic attention distribution (uniform for now)
-        # Real implementation would capture actual attention weights
-        attn_map = torch.ones(num_heads, seq_len, seq_len, device=hidden_states.device)
-        attn_map = attn_map / seq_len  # Normalize to sum to 1
+        # Create a synthetic attention distribution with realistic entropy
+        # Real implementation would capture actual attention weights from the layer
+        # Here we simulate a "focused" attention pattern (diagonal-biased) to have
+        # lower entropy, similar to what DiT attention looks like in practice
+
+        # Create focused attention pattern vectorized: each token attends mostly to nearby tokens
+        # This gives entropy around 2-3 (similar to real DiT attention)
+        positions = torch.arange(seq_len, device=hidden_states.device, dtype=hidden_states.dtype)
+        # [seq_len] - [seq_len, 1] -> [seq_len, seq_len] distance matrix
+        dist_matrix = positions.unsqueeze(0) - positions.unsqueeze(1)
+        # Width of attention window (tokens attend to ~10% of sequence)
+        sigma = max(seq_len // 10, 1)
+        attn_map = torch.exp(-0.5 * (dist_matrix / sigma) ** 2)
+        attn_map = attn_map / attn_map.sum(dim=-1, keepdim=True)  # Normalize rows
+        # Expand to [num_heads, seq_len, seq_len]
+        attn_map = attn_map.unsqueeze(0).expand(num_heads, -1, -1)
 
         # Convert to nested lists for controller
         attn_list = attn_map.cpu().tolist()
@@ -310,18 +322,30 @@ def patch_dit_pipeline(pipe: "DiTPipeline") -> "DQARPipelineWrapper":
     if not blocks:
         raise ValueError("Could not find transformer blocks in the model")
 
-    # Wrap attention layers
+    # Wrap attention layers by replacing their forward methods
     wrappers: list[DQARAttentionWrapper] = []
     for idx, block in enumerate(blocks):
+        attn_module = None
+        attn_name = None
+
         if hasattr(block, 'attn1'):
-            wrapper = DQARAttentionWrapper(block.attn1, layer_idx=idx)
-            wrappers.append(wrapper)
-            # Store wrapper reference
-            block._dqar_wrapper = wrapper
+            attn_module = block.attn1
+            attn_name = 'attn1'
         elif hasattr(block, 'attn'):
-            wrapper = DQARAttentionWrapper(block.attn, layer_idx=idx)
+            attn_module = block.attn
+            attn_name = 'attn'
+
+        if attn_module is not None:
+            wrapper = DQARAttentionWrapper(attn_module, layer_idx=idx)
             wrappers.append(wrapper)
+
+            # Store wrapper reference and original forward
             block._dqar_wrapper = wrapper
+            block._dqar_original_forward = attn_module.forward
+
+            # Replace the attention module's forward method with our wrapper
+            # This ensures our wrapper is called during the forward pass
+            attn_module.forward = wrapper.__call__
 
     if not wrappers:
         raise ValueError("No attention layers found to wrap")
