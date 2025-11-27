@@ -56,6 +56,11 @@ class DQARAttentionProcessor:
     4. On reuse decision, returns cached output (ACTUAL computation skip)
     """
 
+    # Class-level step tracking (shared across all processors)
+    _global_call_count: int = 0
+    _global_step: int = 0
+    _num_layers: int = 0
+
     def __init__(
         self,
         layer_idx: int,
@@ -69,6 +74,37 @@ class DQARAttentionProcessor:
         # Cache for output reuse (stores full output tensor)
         self._cached_output: Optional[torch.Tensor] = None
         self._cached_step: int = -1
+
+    @classmethod
+    def reset_step_tracking(cls, num_layers: int):
+        """Reset step tracking for a new generation."""
+        cls._global_call_count = 0
+        cls._global_step = 0
+        cls._num_layers = num_layers
+
+    @classmethod
+    def _track_step(cls, controller: "DQARController") -> int:
+        """Track which step we're on based on call count."""
+        if cls._num_layers == 0:
+            return 0
+
+        # Increment call count
+        cls._global_call_count += 1
+
+        # Calculate current step (each step processes all layers)
+        new_step = (cls._global_call_count - 1) // cls._num_layers
+
+        # If step changed, notify controller
+        if new_step != cls._global_step:
+            cls._global_step = new_step
+            if controller is not None:
+                controller.begin_step(
+                    step_index=new_step,
+                    total_steps=controller.total_steps,
+                    prompt_length=controller.prompt_length,
+                )
+
+        return cls._global_step
 
     def set_controller(self, controller: Optional["DQARController"], branch: str = "cond"):
         """Set the active DQAR controller."""
@@ -109,6 +145,9 @@ class DQARAttentionProcessor:
                     attn, hidden_states, encoder_hidden_states, attention_mask, temb, *args, **kwargs
                 )
             return self._compute_attention(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
+
+        # Track step based on call count (for pipelines without callback support)
+        self._track_step(controller)
 
         # Check if we should reuse cached output
         decision = controller.should_reuse(self.layer_idx, branch=self._branch)
@@ -382,17 +421,24 @@ class DQARPipelineWrapper:
         self._active_controller = controller
 
         try:
-            # Add callback for step updates if controller provided
+            # Initialize controller with total steps if provided
             if controller is not None:
+                num_steps = kwargs.get('num_inference_steps', 50)
+                prompt_length = 16
+                if 'prompt' in kwargs and kwargs['prompt']:
+                    prompt_length = len(str(kwargs['prompt']).split())
+                # Initialize controller state
+                controller.total_steps = num_steps
+                controller.prompt_length = prompt_length
+                # Reset step tracking for new generation
+                DQARAttentionProcessor.reset_step_tracking(self._dqar_num_layers)
+
+            # Try to add callback for step updates (not all pipelines support this)
+            if controller is not None and hasattr(self._pipe, '_callback_tensor_inputs'):
                 original_callback = kwargs.get('callback_on_step_end')
 
                 def step_callback(pipe, step_idx, timestep, callback_kwargs):
                     if self._active_controller:
-                        num_steps = kwargs.get('num_inference_steps', 50)
-                        # For class-conditional models, use a default prompt length
-                        prompt_length = 16
-                        if 'prompt' in kwargs and kwargs['prompt']:
-                            prompt_length = len(str(kwargs['prompt']).split())
                         self._active_controller.begin_step(
                             step_index=step_idx,
                             total_steps=num_steps,
