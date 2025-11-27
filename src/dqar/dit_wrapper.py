@@ -3,23 +3,25 @@ DiT Integration Wrapper for DQAR.
 
 This module provides patches and wrappers to integrate DQAR's attention reuse
 into HuggingFace DiT pipelines. It hooks into the transformer attention layers
-to enable entropy-gated KV cache reuse.
+via custom AttentionProcessors to capture real attention weights and enable
+actual computation skipping.
 
 Usage:
     from dqar.dit_wrapper import patch_dit_pipeline
 
     pipe = DiTPipeline.from_pretrained("facebook/DiT-XL-2-256")
-    patch_dit_pipeline(pipe)  # Now supports DQAR controller
+    pipe = patch_dit_pipeline(pipe)  # Now supports DQAR controller
 
     controller = DQARController(num_layers=28)
-    output = pipe(prompt, controller=controller)
+    output = pipe(class_labels=[207], controller=controller)
 """
 
 from __future__ import annotations
 
 import math
+import weakref
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Any
 
 if TYPE_CHECKING:
     from .controller import DQARController
@@ -27,165 +29,294 @@ if TYPE_CHECKING:
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     from diffusers import DiTPipeline
     from diffusers.models.attention import Attention
+    from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
     torch = None
     nn = None
+    F = None
     DiTPipeline = None
     Attention = None
+    AttnProcessor = None
+    AttnProcessor2_0 = None
 
 
-class DQARAttentionWrapper:
+class DQARAttentionProcessor:
     """
-    Wrapper that intercepts attention computation for DQAR integration.
+    Custom AttentionProcessor that enables DQAR caching with REAL attention weights.
 
-    This wrapper:
-    1. Computes attention normally on first call (or when reuse not allowed)
-    2. Caches K, V tensors with quantization
-    3. Reuses cached K, V when entropy conditions are met
+    This processor:
+    1. Computes Q, K, V projections
+    2. Computes attention_probs (captures REAL attention weights for entropy)
+    3. Caches the full output tensor for reuse
+    4. On reuse decision, returns cached output (ACTUAL computation skip)
     """
 
     def __init__(
         self,
-        original_attention: "Attention",
         layer_idx: int,
+        original_processor: Any = None,
     ):
-        self.original = original_attention
         self.layer_idx = layer_idx
-        self._controller: Optional["DQARController"] = None
+        self.original_processor = original_processor
+        self._controller_ref: Optional[weakref.ref] = None
         self._branch: str = "cond"
 
+        # Cache for output reuse (stores full output tensor)
+        self._cached_output: Optional[torch.Tensor] = None
+        self._cached_step: int = -1
+
     def set_controller(self, controller: Optional["DQARController"], branch: str = "cond"):
-        """Set the active DQAR controller for this attention layer."""
-        self._controller = controller
+        """Set the active DQAR controller."""
+        if controller is not None:
+            self._controller_ref = weakref.ref(controller)
+        else:
+            self._controller_ref = None
         self._branch = branch
+
+    def _get_controller(self) -> Optional["DQARController"]:
+        """Get controller from weak reference."""
+        if self._controller_ref is None:
+            return None
+        return self._controller_ref()
 
     def __call__(
         self,
+        attn: "Attention",
         hidden_states: "torch.Tensor",
         encoder_hidden_states: Optional["torch.Tensor"] = None,
         attention_mask: Optional["torch.Tensor"] = None,
+        temb: Optional["torch.Tensor"] = None,
+        *args,
         **kwargs,
     ) -> "torch.Tensor":
-        if self._controller is None:
-            return self.original(
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=attention_mask,
-                **kwargs,
-            )
+        """
+        Process attention with DQAR caching.
 
-        # Check if we can reuse cached attention
-        decision = self._controller.should_reuse(self.layer_idx, branch=self._branch)
+        When controller approves reuse, returns cached output directly.
+        Otherwise, computes fresh attention and caches results.
+        """
+        controller = self._get_controller()
+
+        # No controller - use original processor or compute normally
+        if controller is None:
+            if self.original_processor is not None:
+                return self.original_processor(
+                    attn, hidden_states, encoder_hidden_states, attention_mask, temb, *args, **kwargs
+                )
+            return self._compute_attention(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
+
+        # Check if we should reuse cached output
+        decision = controller.should_reuse(self.layer_idx, branch=self._branch)
 
         if decision.use_cache and decision.entry is not None:
-            # Reuse cached K, V
-            cached_k, cached_v, cached_residual = self._controller.reuse(decision.entry)
+            # ACTUAL COMPUTATION SKIP - return cached output directly
+            cached_output = getattr(decision.entry, '_cached_output', None)
+            if cached_output is not None and cached_output.shape == hidden_states.shape:
+                controller._total_reuse_count += 1
+                return cached_output.to(hidden_states.device, hidden_states.dtype)
 
-            if cached_residual is not None:
-                # Apply cached residual directly
-                residual_tensor = torch.tensor(
-                    cached_residual,
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-                # Reshape to match hidden states
-                if residual_tensor.numel() == hidden_states.numel():
-                    residual_tensor = residual_tensor.view_as(hidden_states)
-                    return hidden_states + residual_tensor
-
-            # Fallback: compute attention with cached K, V
-            # This requires custom attention computation
-            return self._compute_with_cached_kv(
-                hidden_states,
-                cached_k,
-                cached_v,
-                encoder_hidden_states,
-                attention_mask,
-                **kwargs,
-            )
-
-        # Compute fresh attention
-        output = self.original(
-            hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
-            **kwargs,
+        # Compute fresh attention with real attention weights capture
+        output, attention_probs = self._compute_attention_with_weights(
+            attn, hidden_states, encoder_hidden_states, attention_mask, temb
         )
 
-        # Extract attention info for caching
-        self._cache_attention(hidden_states, output)
+        # Cache results with REAL attention weights
+        self._cache_attention_output(controller, hidden_states, output, attention_probs, attn.heads)
 
         return output
 
-    def _compute_with_cached_kv(
+    def _compute_attention(
         self,
+        attn: "Attention",
         hidden_states: "torch.Tensor",
-        cached_k: Optional[object],
-        cached_v: object,
         encoder_hidden_states: Optional["torch.Tensor"],
         attention_mask: Optional["torch.Tensor"],
-        **kwargs,
+        temb: Optional["torch.Tensor"],
     ) -> "torch.Tensor":
-        """Compute attention using cached K, V tensors."""
-        # This is a simplified implementation; real integration would
-        # need to properly reconstruct K, V tensors and compute attention
-        # For now, fall back to normal computation
-        return self.original(
-            hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
-            **kwargs,
+        """Compute attention without weight capture (fallback path)."""
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
 
-    def _cache_attention(
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # Use scaled_dot_product_attention if available (PyTorch 2.0+)
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # Linear projection
+        hidden_states = attn.to_out[0](hidden_states)
+        # Dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+    def _compute_attention_with_weights(
         self,
+        attn: "Attention",
+        hidden_states: "torch.Tensor",
+        encoder_hidden_states: Optional["torch.Tensor"],
+        attention_mask: Optional["torch.Tensor"],
+        temb: Optional["torch.Tensor"],
+    ) -> tuple["torch.Tensor", "torch.Tensor"]:
+        """
+        Compute attention AND capture attention weights for entropy calculation.
+
+        Returns:
+            Tuple of (output, attention_probs) where attention_probs has shape
+            [batch_size, num_heads, seq_len, seq_len]
+        """
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # Compute attention scores manually to capture attention_probs
+        scale = 1.0 / math.sqrt(head_dim)
+        attention_scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+
+        # REAL attention probabilities - this is what we need for entropy!
+        attention_probs = F.softmax(attention_scores, dim=-1)
+
+        # Compute attention output
+        hidden_states = torch.matmul(attention_probs, value)
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # Linear projection
+        hidden_states = attn.to_out[0](hidden_states)
+        # Dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states, attention_probs
+
+    def _cache_attention_output(
+        self,
+        controller: "DQARController",
         hidden_states: "torch.Tensor",
         output: "torch.Tensor",
+        attention_probs: "torch.Tensor",
+        num_heads: int,
     ) -> None:
-        """Cache attention outputs for future reuse."""
-        if self._controller is None:
-            return
+        """
+        Cache attention output with REAL entropy from attention_probs.
+
+        Args:
+            controller: DQAR controller
+            hidden_states: Input tensor
+            output: Output tensor to cache
+            attention_probs: Real attention weights [batch, heads, seq, seq]
+            num_heads: Number of attention heads
+        """
+        # Compute REAL entropy from actual attention probabilities
+        # attention_probs shape: [batch_size, num_heads, seq_len, seq_len]
+        # Average over batch dimension for entropy calculation
+        attn_for_entropy = attention_probs.mean(dim=0)  # [heads, seq, seq]
+
+        # Convert to list format for controller
+        attn_list = attn_for_entropy.detach().cpu().tolist()
 
         # Compute residual
         residual = (output - hidden_states).detach()
 
-        # Create dummy attention map for entropy computation
-        # In real implementation, this would be captured from the attention layer
-        batch_size = hidden_states.shape[0]
-        seq_len = hidden_states.shape[1] if hidden_states.dim() > 2 else 1
-        num_heads = getattr(self.original, 'heads', 8)
+        # Get sequence length
+        seq_len = attention_probs.shape[-1]
 
-        # Create a synthetic attention distribution with realistic entropy
-        # Real implementation would capture actual attention weights from the layer
-        # Here we simulate a "focused" attention pattern (diagonal-biased) to have
-        # lower entropy, similar to what DiT attention looks like in practice
+        # Create minimal K, V placeholders (we cache full output instead)
+        k_list = [[0.0] * 16 for _ in range(min(seq_len, 64))]
+        v_list = [[0.0] * 16 for _ in range(min(seq_len, 64))]
 
-        # Create focused attention pattern vectorized: each token attends mostly to nearby tokens
-        # This gives entropy around 2-3 (similar to real DiT attention)
-        positions = torch.arange(seq_len, device=hidden_states.device, dtype=hidden_states.dtype)
-        # [seq_len] - [seq_len, 1] -> [seq_len, seq_len] distance matrix
-        dist_matrix = positions.unsqueeze(0) - positions.unsqueeze(1)
-        # Width of attention window (tokens attend to ~10% of sequence)
-        sigma = max(seq_len // 10, 1)
-        attn_map = torch.exp(-0.5 * (dist_matrix / sigma) ** 2)
-        attn_map = attn_map / attn_map.sum(dim=-1, keepdim=True)  # Normalize rows
-        # Expand to [num_heads, seq_len, seq_len]
-        attn_map = attn_map.unsqueeze(0).expand(num_heads, -1, -1)
+        latent_list = hidden_states.mean(dim=0).flatten()[:256].cpu().tolist()
+        residual_list = residual.mean(dim=0).flatten()[:256].cpu().tolist()
 
-        # Convert to nested lists for controller
-        attn_list = attn_map.cpu().tolist()
-        latent_list = hidden_states.mean(dim=0).flatten().cpu().tolist()
-        residual_list = residual.mean(dim=0).flatten().cpu().tolist()
-
-        # Create dummy K, V (real implementation would extract from attention)
-        k_list = [[0.0] * 16 for _ in range(seq_len)]
-        v_list = [[0.0] * 16 for _ in range(seq_len)]
-
-        self._controller.commit(
+        # Commit to controller cache
+        entry = controller.commit(
             layer_id=self.layer_idx,
             branch=self._branch,
             attn_map=attn_list,
@@ -195,20 +326,23 @@ class DQARAttentionWrapper:
             residual=residual_list,
         )
 
+        # Store full output tensor on the cache entry for direct reuse
+        entry._cached_output = output.detach().clone()
+
 
 class DQARPipelineWrapper:
     """
     Wrapper class for DiTPipeline that adds DQAR controller support.
 
     This wrapper intercepts calls to the pipeline and manages the DQAR
-    controller lifecycle, setting it on attention wrappers before inference
+    controller lifecycle, setting it on attention processors before inference
     and clearing it afterwards.
     """
 
-    def __init__(self, pipe: "DiTPipeline", wrappers: list):
+    def __init__(self, pipe: "DiTPipeline", processors: list):
         self._pipe = pipe
-        self._dqar_wrappers = wrappers
-        self._dqar_num_layers = len(wrappers)
+        self._dqar_processors = processors
+        self._dqar_num_layers = len(processors)
         self._active_controller = None
 
         # Copy commonly accessed attributes from the wrapped pipeline
@@ -241,9 +375,9 @@ class DQARPipelineWrapper:
         # Extract DQAR-specific kwargs
         branch = kwargs.pop('dqar_branch', 'cond')
 
-        # Set controller on all wrappers
-        for wrapper in self._dqar_wrappers:
-            wrapper.set_controller(controller, branch=branch)
+        # Set controller on all processors
+        for processor in self._dqar_processors:
+            processor.set_controller(controller, branch=branch)
 
         self._active_controller = controller
 
@@ -274,8 +408,8 @@ class DQARPipelineWrapper:
             return self._pipe(*args, **kwargs)
         finally:
             # Clear controller references
-            for wrapper in self._dqar_wrappers:
-                wrapper.set_controller(None)
+            for processor in self._dqar_processors:
+                processor.set_controller(None)
             self._active_controller = None
 
     def to(self, device):
@@ -293,7 +427,7 @@ def patch_dit_pipeline(pipe: "DiTPipeline") -> "DQARPipelineWrapper":
     Patch a DiTPipeline to support DQAR controller integration.
 
     This function:
-    1. Wraps each attention layer with DQARAttentionWrapper
+    1. Replaces attention processors with DQARAttentionProcessor
     2. Returns a wrapper that accepts a controller argument
     3. Hooks step callbacks to update controller state
 
@@ -322,37 +456,40 @@ def patch_dit_pipeline(pipe: "DiTPipeline") -> "DQARPipelineWrapper":
     if not blocks:
         raise ValueError("Could not find transformer blocks in the model")
 
-    # Wrap attention layers by replacing their forward methods
-    wrappers: list[DQARAttentionWrapper] = []
+    # Replace attention processors with DQAR processors
+    processors: list[DQARAttentionProcessor] = []
+
     for idx, block in enumerate(blocks):
         attn_module = None
-        attn_name = None
 
         if hasattr(block, 'attn1'):
             attn_module = block.attn1
-            attn_name = 'attn1'
         elif hasattr(block, 'attn'):
             attn_module = block.attn
-            attn_name = 'attn'
 
         if attn_module is not None:
-            wrapper = DQARAttentionWrapper(attn_module, layer_idx=idx)
-            wrappers.append(wrapper)
+            # Get original processor
+            original_processor = attn_module.processor if hasattr(attn_module, 'processor') else None
 
-            # Store wrapper reference and original forward
-            block._dqar_wrapper = wrapper
-            block._dqar_original_forward = attn_module.forward
+            # Create DQAR processor
+            dqar_processor = DQARAttentionProcessor(
+                layer_idx=idx,
+                original_processor=original_processor,
+            )
+            processors.append(dqar_processor)
 
-            # Replace the attention module's forward method with our wrapper
-            # This ensures our wrapper is called during the forward pass
-            attn_module.forward = wrapper.__call__
+            # Replace the processor
+            attn_module.processor = dqar_processor
 
-    if not wrappers:
-        raise ValueError("No attention layers found to wrap")
+            # Store reference to original
+            block._dqar_original_processor = original_processor
+
+    if not processors:
+        raise ValueError("No attention layers found to patch")
 
     # Create and return wrapper
-    wrapped = DQARPipelineWrapper(pipe, wrappers)
-    print(f"[DQAR] Patched pipeline with {len(wrappers)} attention wrappers")
+    wrapped = DQARPipelineWrapper(pipe, processors)
+    print(f"[DQAR] Patched pipeline with {len(processors)} attention processors")
     return wrapped
 
 
@@ -380,4 +517,4 @@ def get_dit_layer_count(pipe) -> int:
     return len(blocks)
 
 
-__all__ = ["patch_dit_pipeline", "get_dit_layer_count", "DQARAttentionWrapper", "DQARPipelineWrapper"]
+__all__ = ["patch_dit_pipeline", "get_dit_layer_count", "DQARAttentionProcessor", "DQARPipelineWrapper"]
